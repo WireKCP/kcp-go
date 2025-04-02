@@ -910,6 +910,67 @@ type (
 )
 
 // packet input stage
+func (l *Listener) PacketInput(data []byte, addr net.Addr) {
+	decrypted := false
+	if l.block != nil && len(data) >= cryptHeaderSize {
+		l.block.Decrypt(data, data)
+		data = data[nonceSize:]
+		checksum := crc32.ChecksumIEEE(data[crcSize:])
+		if checksum == binary.LittleEndian.Uint32(data) {
+			data = data[crcSize:]
+			decrypted = true
+		} else {
+			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+		}
+	} else if l.block == nil {
+		decrypted = true
+	}
+
+	if decrypted && len(data) >= IKCP_OVERHEAD {
+		l.sessionLock.RLock()
+		s, ok := l.sessions[addr.String()]
+		l.sessionLock.RUnlock()
+
+		var conv, sn uint32
+		convRecovered := false
+		fecFlag := binary.LittleEndian.Uint16(data[4:])
+		if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+			// packet with FEC
+			if fecFlag == typeData && len(data) >= fecHeaderSizePlus2+IKCP_OVERHEAD {
+				conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+				sn = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
+				convRecovered = true
+			}
+		} else {
+			// packet without FEC
+			conv = binary.LittleEndian.Uint32(data)
+			sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
+			convRecovered = true
+		}
+
+		if ok { // existing connection
+			if !convRecovered || conv == s.kcp.conv { // parity data or valid conversation
+				s.kcpInput(data)
+			} else if sn == 0 { // should replace current connection
+				s.Close()
+				s = nil
+			}
+		}
+
+		if s == nil && convRecovered { // new session
+			if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
+				s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
+				s.kcpInput(data)
+				l.sessionLock.Lock()
+				l.sessions[addr.String()] = s
+				l.sessionLock.Unlock()
+				l.chAccepts <- s
+			}
+		}
+	}
+}
+
+// packet input stage
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	decrypted := false
 	if l.block != nil && len(data) >= cryptHeaderSize {
