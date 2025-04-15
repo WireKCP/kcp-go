@@ -892,6 +892,100 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 }
 
+func (s *UDPSession) KcpInput(data []byte) {
+	var kcpInErrors, fecErrs, fecRecovered, fecParityShards uint64
+
+	fecFlag := binary.LittleEndian.Uint16(data[4:])
+	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+		if len(data) >= fecHeaderSizePlus2 {
+			f := fecPacket(data)
+			if f.flag() == typeParity {
+				fecParityShards++
+			}
+
+			// lock
+			s.mu.Lock()
+			// if fecDecoder is not initialized, create one with default parameter
+			// lazy initialization
+			if s.fecDecoder == nil {
+				s.fecDecoder = newFECDecoder(1, 1)
+			}
+
+			// FEC decoding
+			recovers := s.fecDecoder.decode(f)
+			if f.flag() == typeData {
+				if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true, s.ackNoDelay); ret != 0 {
+					kcpInErrors++
+				}
+			}
+
+			// If there're some packets recovered from FEC, feed them into kcp
+			for _, r := range recovers {
+				if len(r) >= 2 { // must be larger than 2bytes
+					sz := binary.LittleEndian.Uint16(r)
+					if int(sz) <= len(r) && sz >= 2 {
+						if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
+							fecRecovered++
+						} else {
+							kcpInErrors++
+						}
+					} else {
+						fecErrs++
+					}
+				} else {
+					fecErrs++
+				}
+				// recycle the buffer
+				xmitBuf.Put(r)
+			}
+
+			// to notify the readers to receive the data if there's any
+			if n := s.kcp.PeekSize(); n > 0 {
+				s.notifyReadEvent()
+			}
+
+			// to notify the writers if the window size allows to send more packets
+			// and the remote window size is not full.
+			waitsnd := s.kcp.WaitSnd()
+			if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+				s.notifyWriteEvent()
+			}
+			s.mu.Unlock()
+		} else {
+			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+		}
+	} else {
+		s.mu.Lock()
+		if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
+			kcpInErrors++
+		}
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
+		}
+		waitsnd := s.kcp.WaitSnd()
+		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+			s.notifyWriteEvent()
+		}
+		s.mu.Unlock()
+	}
+
+	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
+	if fecParityShards > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECParityShards, fecParityShards)
+	}
+	if kcpInErrors > 0 {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+	}
+	if fecErrs > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECErrs, fecErrs)
+	}
+	if fecRecovered > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
+	}
+
+}
+
 type (
 	// Listener defines a server which will be waiting to accept incoming connections
 	Listener struct {
@@ -977,6 +1071,70 @@ func (l *Listener) PacketInput(data []byte, addr net.Addr) {
 			}
 		}
 	}
+}
+
+// packet input and Returns the session to the listener
+func (l *Listener) PacketInputWithSession(data []byte, addr net.Addr) *UDPSession {
+	decrypted := false
+	if l.block != nil && len(data) >= cryptHeaderSize {
+		l.block.Decrypt(data, data)
+		data = data[nonceSize:]
+		checksum := crc32.ChecksumIEEE(data[crcSize:])
+		if checksum == binary.LittleEndian.Uint32(data) {
+			data = data[crcSize:]
+			decrypted = true
+		} else {
+			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+		}
+	} else if l.block == nil {
+		decrypted = true
+	}
+
+	if decrypted && len(data) >= IKCP_OVERHEAD {
+		l.sessionLock.RLock()
+		s, ok := l.sessions[addr.String()]
+		l.sessionLock.RUnlock()
+
+		var conv, sn uint32
+		convRecovered := false
+		fecFlag := binary.LittleEndian.Uint16(data[4:])
+		if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+			// packet with FEC
+			if fecFlag == typeData && len(data) >= fecHeaderSizePlus2+IKCP_OVERHEAD {
+				conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+				sn = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
+				convRecovered = true
+			}
+		} else {
+			// packet without FEC
+			conv = binary.LittleEndian.Uint32(data)
+			sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
+			convRecovered = true
+		}
+
+		if ok { // existing connection
+			if !convRecovered || conv == s.kcp.conv { // parity data or valid conversation
+				s.kcpInput(data)
+				return s
+			} else if sn == 0 { // should replace current connection
+				s.Close()
+				s = nil
+			}
+		}
+
+		if s == nil && convRecovered { // new session
+			if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
+				s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
+				s.kcpInput(data)
+				l.sessionLock.Lock()
+				l.sessions[addr.String()] = s
+				l.sessionLock.Unlock()
+				l.chAccepts <- s
+				return s
+			}
+		}
+	}
+	return nil
 }
 
 // packet input stage
